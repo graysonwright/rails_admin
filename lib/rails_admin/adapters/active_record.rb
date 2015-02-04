@@ -1,250 +1,222 @@
 require 'active_record'
-require 'rails_admin/config/sections/list'
-require 'rails_admin/abstract_object'
+require 'rails_admin/adapters/active_record/abstract_object'
+require 'rails_admin/adapters/active_record/association'
+require 'rails_admin/adapters/active_record/property'
 
 module RailsAdmin
   module Adapters
     module ActiveRecord
-      DISABLED_COLUMN_TYPES = [:tsvector]
-      @@polymorphic_parents = nil
-      def self.extended(abstract_model)
+      DISABLED_COLUMN_TYPES = [:tsvector, :blob, :binary, :spatial, :hstore, :geometry]
 
-        # ActiveRecord does not handle has_one relationships the way it does for has_many,
-        # and does not create any association_id and association_id= methods.
-        # Added here for backward compatibility after a refactoring, but it does belong to ActiveRecord IMO.
-        # Support is hackish at best. Atomicity is respected for creation, but not while updating.
-        # It means a failed validation at update on the parent object could still modify target belongs_to foreign ids.
-        #
-        #
-        abstract_model.model.reflect_on_all_associations.select{|assoc| assoc.macro.to_s == 'has_one'}.each do |association|
-          abstract_model.model.send(:define_method, "#{association.name}_id") do
-            self.send(association.name).try(:id)
-          end
-          abstract_model.model.send(:define_method, "#{association.name}_id=") do |id|
-            self.send(association.name.to_s + '=', associated = (id.blank? ? nil : association.klass.find_by_id(id)))
-          end
-        end
-      end
-
-      def self.polymorphic_parents(name)
-        @@polymorphic_parents ||= {}.tap do |hash|
-          RailsAdmin::AbstractModel.all_models.each do |klass|
-            klass.reflect_on_all_associations.select{|r| r.options[:as] }.each do |reflection|
-              (hash[reflection.options[:as].to_sym] ||= []) << klass
-            end
-          end
-        end
-        @@polymorphic_parents[name.to_sym]
+      def new(params = {})
+        AbstractObject.new(model.new(params))
       end
 
       def get(id)
-        if object = model.where(model.primary_key => id).first
-          RailsAdmin::AbstractObject.new object
-        else
-          nil
-        end
+        return unless object = model.where(primary_key => id).first
+        AbstractObject.new object
       end
 
-      def get_bulk(ids, scope = nil)
-        (scope || model).where(model.primary_key => ids)
-      end
-
-      def count(options = {}, scope = nil)
-        (scope || model).count(options.except(:sort, :sort_reverse))
+      def scoped
+        model.all
       end
 
       def first(options = {}, scope = nil)
-        (scope || model).reorder(extract_ordering!(options)).first(options)
+        all(options, scope).first
       end
-      
+
       def all(options = {}, scope = nil)
-        (scope || model).reorder(extract_ordering!(options)).all(options)
-      end
-
-      def paginated(options = {}, scope = nil)
-        page = options.delete(:page) || 1
-        per_page = options.delete(:per_page) || RailsAdmin::Config::Sections::List.default_items_per_page
-
-        page_count = (count(options, scope).to_f / per_page).ceil
-
-        options.merge!({
-          :limit => per_page,
-          :offset => (page - 1) * per_page
-        })
-
-        [page_count, all(options, scope)]
-      end
-
-      def create(params = {})
-        model.create(params)
-      end
-
-      def new(params = {})
-        RailsAdmin::AbstractObject.new(model.new(params))
-      end
-
-      def destroy(ids, scope = nil)
-        scope ||= model
-        scope.destroy_all(model.primary_key => ids)
-      end
-
-      def destroy_all!
-        model.all.each do |object|
-          object.destroy
+        scope ||= scoped
+        scope = scope.includes(options[:include]) if options[:include]
+        scope = scope.limit(options[:limit]) if options[:limit]
+        scope = scope.where(primary_key => options[:bulk_ids]) if options[:bulk_ids]
+        scope = query_scope(scope, options[:query]) if options[:query]
+        scope = filter_scope(scope, options[:filters]) if options[:filters]
+        if options[:page] && options[:per]
+          scope = scope.send(Kaminari.config.page_method_name, options[:page]).per(options[:per])
         end
+        scope = scope.reorder("#{options[:sort]} #{options[:sort_reverse] ? 'asc' : 'desc'}") if options[:sort]
+        scope
       end
 
-      def has_and_belongs_to_many_associations
-        associations.select do |association|
-          association[:type] == :has_and_belongs_to_many
-        end
+      def count(options = {}, scope = nil)
+        all(options.merge(limit: false, page: false), scope).count
       end
 
-      def has_many_associations
-        associations.select do |association|
-          association[:type] == :has_many
-        end
-      end
-
-      def has_one_associations
-        associations.select do |association|
-          association[:type] == :has_one
-        end
-      end
-
-      def belongs_to_associations
-        associations.select do |association|
-          association[:type] == :belongs_to
-        end
+      def destroy(objects)
+        Array.wrap(objects).each(&:destroy)
       end
 
       def associations
-        model.reflect_on_all_associations.map do |association|
-          {
-            :name => association.name.to_sym,
-            :pretty_name => association.name.to_s.tr('_', ' ').capitalize,
-            :type => association.macro,
-            :parent_model => association_parent_model_lookup(association),
-            :parent_key => association_parent_key_lookup(association),
-            :child_model => association_child_model_lookup(association),
-            :child_key => association_child_key_lookup(association),
-            :foreign_type => association_foreign_type_lookup(association),
-            :as => association_as_lookup(association),
-            :polymorphic => association_polymorphic_lookup(association),
-            :inverse_of => association_inverse_of_lookup(association),
-            :read_only => association_read_only_lookup(association)
-          }
-        end
-      end
-
-      def polymorphic_associations
-        (has_many_associations + has_one_associations).select do |association|
-          association[:options][:as]
+        model.reflect_on_all_associations.collect do |association|
+          Association.new(association, model)
         end
       end
 
       def properties
-        columns = model.columns.reject {|c| DISABLED_COLUMN_TYPES.include?(c.type.to_sym) }
-        columns.map do |property|
-          {
-            :name => property.name.to_sym,
-            :pretty_name => property.name.to_s.tr('_', ' ').capitalize,
-            :type => property.type,
-            :length => property.limit,
-            :nullable? => property.null,
-            :serial? => property.primary,
-          }
+        columns = model.columns.reject do |c|
+          c.type.blank? ||
+          DISABLED_COLUMN_TYPES.include?(c.type.to_sym) ||
+          c.try(:array)
+        end
+        columns.collect do |property|
+          Property.new(property, model)
         end
       end
 
-      def model_store_exists?
-        model.table_exists?
+      delegate :primary_key, :table_name, to: :model, prefix: false
+
+      def encoding
+        encoding = ::ActiveRecord::Base.connection.try(:encoding)
+        encoding ||= ::ActiveRecord::Base.connection.try(:charset) # mysql2
+        encoding || 'UTF-8'
       end
+
+      def embedded?
+        false
+      end
+
+      def cyclic?
+        false
+      end
+
+      def adapter_supports_joins?
+        true
+      end
+
+      class WhereBuilder
+        def initialize(scope)
+          @statements = []
+          @values = []
+          @tables = []
+          @scope = scope
+        end
+
+        def add(field, value, operator)
+          field.searchable_columns.flatten.each do |column_infos|
+            statement, value1, value2 = StatementBuilder.new(column_infos[:column], column_infos[:type], value, operator).to_statement
+            @statements << statement if statement.present?
+            @values << value1 unless value1.nil?
+            @values << value2 unless value2.nil?
+            table, column = column_infos[:column].split('.')
+            @tables.push(table) if column
+          end
+        end
+
+        def build
+          scope = @scope.where(@statements.join(' OR '), *@values)
+          scope = scope.references(*(@tables.uniq)) if @tables.any?
+          scope
+        end
+      end
+
+      def query_scope(scope, query, fields = config.list.fields.select(&:queryable?))
+        wb = WhereBuilder.new(scope)
+        fields.each do |field|
+          wb.add(field, query, field.search_operator)
+        end
+        # OR all query statements
+        wb.build
+      end
+
+      # filters example => {"string_field"=>{"0055"=>{"o"=>"like", "v"=>"test_value"}}, ...}
+      # "0055" is the filter index, no use here. o is the operator, v the value
+      def filter_scope(scope, filters, fields = config.list.fields.select(&:filterable?))
+        filters.each_pair do |field_name, filters_dump|
+          filters_dump.each do |_, filter_dump|
+            wb = WhereBuilder.new(scope)
+            wb.add(fields.detect { |f| f.name.to_s == field_name }, filter_dump[:v], (filter_dump[:o] || 'default'))
+            # AND current filter statements to other filter statements
+            scope = wb.build
+          end
+        end
+        scope
+      end
+
+      def build_statement(column, type, value, operator)
+        StatementBuilder.new(column, type, value, operator).to_statement
+      end
+
+      class StatementBuilder < RailsAdmin::AbstractModel::StatementBuilder
+      protected
+
+        def unary_operators
+          {
+            '_blank' => ["(#{@column} IS NULL OR #{@column} = '')"],
+            '_present' => ["(#{@column} IS NOT NULL AND #{@column} != '')"],
+            '_null' => ["(#{@column} IS NULL)"],
+            '_not_null' => ["(#{@column} IS NOT NULL)"],
+            '_empty' => ["(#{@column} = '')"],
+            '_not_empty' => ["(#{@column} != '')"],
+          }
+        end
 
       private
 
-      def extract_ordering!(options)
-        @sort ||= options.delete(:sort) || model.primary_key
-        @sort = (@sort.to_s.include?('.') ? @sort : "#{model.table_name}.#{@sort}")
-        @sort_order ||= options.delete(:sort_reverse) ? "asc" : "desc"
-        "#{@sort} #{@sort_order}"
-      end
-
-      def association_options(association)
-        if association.options[:polymorphic]
-          {
-            :polymorphic => true,
-            :foreign_type => association.options[:foreign_type] || "#{association.name}_type"
-          }
-        elsif association.options[:as]
-          {
-            :as => association.options[:as]
-          }
-        else
-          {}
-        end
-      end
-
-      def association_parent_model_lookup(association)
-        case association.macro
-        when :belongs_to
-          if association.options[:polymorphic]
-            RailsAdmin::Adapters::ActiveRecord.polymorphic_parents(association.name) || []
-          else
-            association.klass
+        def range_filter(min, max)
+          if min && max
+            ["(#{@column} BETWEEN ? AND ?)", min, max]
+          elsif min
+            ["(#{@column} >= ?)", min]
+          elsif max
+            ["(#{@column} <= ?)", max]
           end
-        when :has_one, :has_many, :has_and_belongs_to_many
-          association.active_record
-        else
-          raise "Unknown association type: #{association.macro.inspect}"
         end
-      end
 
-      def association_foreign_type_lookup(association)
-        if association.options[:polymorphic]
-          association.options[:foreign_type].try(:to_sym) || :"#{association.name}_type"
+        def build_statement_for_type
+          case @type
+          when :boolean                   then build_statement_for_boolean
+          when :integer, :decimal, :float then build_statement_for_integer_decimal_or_float
+          when :string, :text             then build_statement_for_string_or_text
+          when :enum                      then build_statement_for_enum
+          when :belongs_to_association    then build_statement_for_belongs_to_association
+          end
         end
-      end
 
-      def association_as_lookup(association)
-        association.options[:as].try :to_sym
-      end
-
-      def association_polymorphic_lookup(association)
-        association.options[:polymorphic]
-      end
-
-      def association_parent_key_lookup(association)
-        [:id]
-      end
-
-      def association_inverse_of_lookup(association)
-        association.options[:inverse_of].try :to_sym
-      end
-
-      def association_read_only_lookup(association)
-        association.options[:readonly]
-      end
-
-      def association_child_model_lookup(association)
-        case association.macro
-        when :belongs_to
-          association.active_record
-        when :has_one, :has_many, :has_and_belongs_to_many
-          association.klass
-        else
-          raise "Unknown association type: #{association.macro.inspect}"
+        def build_statement_for_boolean
+          return ["(#{@column} IS NULL OR #{@column} = ?)", false] if %w(false f 0).include?(@value)
+          return ["(#{@column} = ?)", true] if %w(true t 1).include?(@value)
         end
-      end
 
-      def association_child_key_lookup(association)
-        case association.macro
-        when :belongs_to
-          association.options[:foreign_key].try(:to_sym) || "#{association.name}_id".to_sym
-        when :has_one, :has_many, :has_and_belongs_to_many
-          association.foreign_key.to_sym
-        else
-          raise "Unknown association type: #{association.macro.inspect}"
+        def column_for_value(value)
+          ["(#{@column} = ?)", value]
+        end
+
+        def build_statement_for_belongs_to_association
+          return if @value.blank?
+          ["(#{@column} = ?)", @value.to_i] if @value.to_i.to_s == @value
+        end
+
+        def build_statement_for_string_or_text
+          return if @value.blank?
+          @value = begin
+            case @operator
+            when 'default', 'like'
+              "%#{@value.downcase}%"
+            when 'starts_with'
+              "#{@value.downcase}%"
+            when 'ends_with'
+              "%#{@value.downcase}"
+            when 'is', '='
+              "#{@value.downcase}"
+            else
+              return
+            end
+          end
+          ["(LOWER(#{@column}) #{like_operator} ?)", @value]
+        end
+
+        def build_statement_for_enum
+          return if @value.blank?
+          ["(#{@column} IN (?))", Array.wrap(@value)]
+        end
+
+        def ar_adapter
+          ::ActiveRecord::Base.connection.adapter_name.downcase
+        end
+
+        def like_operator
+          ar_adapter == 'postgresql' ? 'ILIKE' : 'LIKE'
         end
       end
     end
